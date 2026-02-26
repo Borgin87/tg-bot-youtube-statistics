@@ -4,6 +4,7 @@
 #   1) pip install -U aiogram python-dotenv
 #   2) create .env with BOT_TOKEN=123:ABC...
 #   3) python bot.py
+# Реальные сиськи лехи
 
 import asyncio
 import logging
@@ -23,6 +24,7 @@ from aiogram.types import (
     CallbackQuery,
 )
 from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
+from db import init_db
 
 try:
     from dotenv import load_dotenv
