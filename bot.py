@@ -1,17 +1,9 @@
-# bot.py
-# Aiogram v3 async Telegram bot with a couple of buttons + FSM (async)
-# Run:
-#   1) pip install -U aiogram python-dotenv
-#   2) create .env with BOT_TOKEN=123:ABC...
-#   3) python bot.py
-# Реальные сиськи лехи
-
 import asyncio
 import logging
 import os
-from dataclasses import dataclass
-from typing import Dict, List, Optional
 
+from aiogram.types import ErrorEvent
+from aiogram.exceptions import TelegramNetworkError
 from aiogram.client.default import DefaultBotProperties
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.enums import ParseMode
@@ -19,12 +11,21 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
+from aiohttp import ClientTimeout
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.types import (
     Message,
     CallbackQuery,
 )
-from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
-from db import init_db
+from db import (
+    init_db,
+    add_user,
+    add_channel_for_user,
+    list_user_channels,
+    remove_channel_for_user,
+)
+from youtube_api import fetch_channel_stats, YouTubeApiError
 
 try:
     from dotenv import load_dotenv
@@ -32,16 +33,6 @@ try:
 except Exception:
     pass
 
-
-# ----------------------------
-# Simple in-memory "storage"
-# ----------------------------
-@dataclass
-class Channel:
-    raw: str  # what user entered (id/url/handle)
-
-
-USER_CHANNELS: Dict[int, List[Channel]] = {}
 
 
 # ----------------------------
@@ -59,7 +50,8 @@ def main_menu_kb():
     kb.button(text="➕ Добавить канал")
     kb.button(text="📊 Мои каналы")
     kb.button(text="ℹ️ Помощь")
-    kb.adjust(2, 1)
+    kb.button(text="📈 Статистика")
+    kb.adjust(2, 2)
     return kb.as_markup(resize_keyboard=True, one_time_keyboard=False)
 
 
@@ -83,12 +75,25 @@ def inline_actions_kb():
 router = Router()
 
 
+@router.errors()
+async def on_error(event: ErrorEvent):
+    if isinstance(event.exception, TelegramNetworkError):
+        logging.warning("TelegramNetworkError: %s", event.exception)
+        return True  # подавили — бот продолжает работать
+    return False
+
 @router.message(CommandStart())
 async def start(message: Message):
+    if message.from_user is None:
+        await message.answer("Не смог определить пользователя.")
+        return
+
+    await add_user(message.from_user.id)
+
     await message.answer(
         "Привет! Я бот-заготовка на *aiogram v3*.\n\n"
         "Кнопки ниже помогут добавить и посмотреть каналы.\n"
-        "Пока я храню каналы в памяти (после перезапуска список очистится).",
+        "Теперь каналы хранятся в SQLite.",
         reply_markup=main_menu_kb(),
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -129,12 +134,6 @@ async def add_channel_btn(message: Message, state: FSMContext):
     )
 
 
-@router.message(AddChannelFlow.waiting_for_channel, F.text == "✖️ Отмена")
-async def cancel_add(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer("Ок, отменил.", reply_markup=main_menu_kb())
-
-
 @router.message(AddChannelFlow.waiting_for_channel, F.text)
 async def add_channel_input(message: Message, state: FSMContext):
     if message.from_user is None or message.text is None:
@@ -144,7 +143,7 @@ async def add_channel_input(message: Message, state: FSMContext):
     user_id = message.from_user.id
     raw = message.text.strip()
 
-    USER_CHANNELS.setdefault(user_id, []).append(Channel(raw=raw))
+    await add_channel_for_user(user_id, raw)
 
     await state.clear()
     await message.answer(
@@ -161,7 +160,7 @@ async def my_channels(message: Message):
         return
 
     user_id = message.from_user.id
-    channels = USER_CHANNELS.get(user_id, [])
+    channels = await list_user_channels(user_id)
 
     if not channels:
         await message.answer(
@@ -170,12 +169,52 @@ async def my_channels(message: Message):
         )
         return
 
-    lines = "\n".join([f"{i+1}) {c.raw}" for i, c in enumerate(channels)])
+    lines = "\n".join([f"{i+1}) {ch}" for i, ch in enumerate(channels)])
     await message.answer(
         "📊 *Твои каналы:*\n" + lines,
         reply_markup=main_menu_kb(),
         parse_mode=ParseMode.MARKDOWN,
     )
+
+
+@router.message(F.text == "📈 Статистика")
+async def stats_btn(message: Message):
+    if message.from_user is None:
+        await message.answer("Не смог определить пользователя.")
+        return
+
+    api_key = os.getenv("YOUTUBE_API_KEY")
+    if not api_key:
+        await message.answer("Не найден YOUTUBE_API_KEY в .env")
+        return
+
+    user_id = message.from_user.id
+    channels = await list_user_channels(user_id)
+
+    # MVP: пока работаем только с UC... ID
+    channel_ids = [c for c in channels if c.startswith("UC")]
+
+    if not channel_ids:
+        await message.answer("Добавь channel_id вида UC... через «➕ Добавить канал».")
+        return
+
+    await message.answer("Собираю статистику, секунду…")
+
+    lines = []
+    for ch_id in channel_ids[:10]:  # ограничим, чтобы не спамить
+        try:
+            st = await fetch_channel_stats(api_key, ch_id)
+            lines.append(
+                f"📺 <b>{st['title']}</b>\n"
+                f"ID: <code>{st['channel_id']}</code>\n"
+                f"👥 Подписчики: <b>{st['subscribers']:,}</b>\n"
+                f"👁 Просмотры: <b>{st['views']:,}</b>\n"
+                f"🎞 Видео: <b>{st['videos']:,}</b>\n"
+            )
+        except YouTubeApiError as e:
+            lines.append(f"❌ <code>{ch_id}</code>: {e}")
+
+    await message.answer("\n\n".join(lines))
 
 
 @router.callback_query(F.data == "ping")
@@ -190,7 +229,10 @@ async def ping_cb(call: CallbackQuery):
 @router.callback_query(F.data == "clear_channels")
 async def clear_channels_cb(call: CallbackQuery):
     user_id = call.from_user.id
-    USER_CHANNELS.pop(user_id, None)
+
+    channels = await list_user_channels(user_id)
+    for ch in channels:
+        await remove_channel_for_user(user_id, ch)
 
     await call.answer("Готово")
     if call.message:
@@ -216,14 +258,21 @@ async def main():
     if not token:
         raise RuntimeError("BOT_TOKEN not found. Set it in env or .env file.")
 
+    session = AiohttpSession(timeout=120)  # <-- ВАЖНО: число, не ClientTimeout
+
     bot = Bot(
-    token=token,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-)
+        token=token,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+        session=session,
+    )
+
+    await init_db()
+
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    # Long polling (async)
+    await dp.start_polling(bot)
+
     await dp.start_polling(bot)
 
 
