@@ -24,6 +24,7 @@ from db import (
     add_channel_for_user,
     list_user_channels,
     remove_channel_for_user,
+    remove_all_channels_for_user,
 )
 from youtube_api import fetch_channel_stats, YouTubeApiError
 
@@ -42,6 +43,9 @@ class AddChannelFlow(StatesGroup):
     waiting_for_channel = State()
 
 
+class DeleteChannelFlow(StatesGroup):
+    waiting_for_channel_delete = State()
+
 # ----------------------------
 # Keyboards
 # ----------------------------
@@ -49,11 +53,10 @@ def main_menu_kb():
     kb = ReplyKeyboardBuilder()
     kb.button(text="➕ Добавить канал")
     kb.button(text="📊 Мои каналы")
+    kb.button(text="➖ Удалить канал")
     kb.button(text="ℹ️ Помощь")
-    kb.button(text="📈 Статистика")
     kb.adjust(2, 2)
     return kb.as_markup(resize_keyboard=True, one_time_keyboard=False)
-
 
 def cancel_kb():
     kb = ReplyKeyboardBuilder()
@@ -132,6 +135,63 @@ async def add_channel_btn(message: Message, state: FSMContext):
         reply_markup=cancel_kb(),
         parse_mode=ParseMode.MARKDOWN,
     )
+
+@router.message(F.text == "➖ Удалить канал")
+async def delete_channel_btn(message: Message, state: FSMContext):
+    if message.from_user is None:
+        await message.answer("Не смог определить пользователя.")
+        return
+
+    user_id = message.from_user.id
+    channels = await list_user_channels(user_id)
+
+    if not channels:
+        await message.answer(
+            "У тебя пока нет каналов для удаления.",
+            reply_markup=main_menu_kb(),
+        )
+        return
+
+    lines = "\n".join([f"{i+1}) {ch}" for i, ch in enumerate(channels)])
+    await state.set_state(DeleteChannelFlow.waiting_for_channel_delete)
+
+    await message.answer(
+        "Отправь channel_id канала, который хочешь удалить:\n\n"
+        f"{lines}\n\n"
+        "Чтобы отменить — нажми ✖️ Отмена.",
+        reply_markup=cancel_kb(),
+    )
+
+
+@router.message(DeleteChannelFlow.waiting_for_channel_delete, F.text == "✖️ Отмена")
+async def cancel_delete(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Удаление отменено.", reply_markup=main_menu_kb())
+
+
+@router.message(DeleteChannelFlow.waiting_for_channel_delete, F.text)
+async def delete_channel_input(message: Message, state: FSMContext):
+    if message.from_user is None or message.text is None:
+        await message.answer("Не смог прочитать сообщение. Попробуй ещё раз.")
+        return
+
+    user_id = message.from_user.id
+    channel_key = message.text.strip()
+
+    deleted = await remove_channel_for_user(user_id, channel_key)
+
+    await state.clear()
+
+    if deleted:
+        await message.answer(
+            f"✅ Канал удалён: <code>{channel_key}</code>",
+            reply_markup=main_menu_kb(),
+        )
+    else:
+        await message.answer(
+            "❌ Такой канал не найден в твоём списке.",
+            reply_markup=main_menu_kb(),
+        )
 
 
 @router.message(AddChannelFlow.waiting_for_channel, F.text)
@@ -229,15 +289,11 @@ async def ping_cb(call: CallbackQuery):
 @router.callback_query(F.data == "clear_channels")
 async def clear_channels_cb(call: CallbackQuery):
     user_id = call.from_user.id
-
-    channels = await list_user_channels(user_id)
-    for ch in channels:
-        await remove_channel_for_user(user_id, ch)
+    deleted_count = await remove_all_channels_for_user(user_id)
 
     await call.answer("Готово")
     if call.message:
-        await call.message.reply("🧹 Список каналов очищен.")
-
+        await call.message.reply(f"🧹 Удалено каналов: {deleted_count}")
 
 @router.message()
 async def fallback(message: Message):
@@ -273,7 +329,6 @@ async def main():
 
     await dp.start_polling(bot)
 
-    await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
