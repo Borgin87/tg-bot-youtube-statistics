@@ -2,6 +2,11 @@ import asyncio
 import logging
 import os
 
+from analytics import build_growth_report
+from db import save_snapshot, get_channel_snapshots
+
+from snapshot_scheduler import build_scheduler, collect_snapshots_once
+
 from aiogram.types import ErrorEvent
 from aiogram.exceptions import TelegramNetworkError
 from aiogram.client.default import DefaultBotProperties
@@ -54,9 +59,10 @@ def main_menu_kb():
     kb.button(text="➕ Добавить канал")
     kb.button(text="📊 Мои каналы")
     kb.button(text="📈 Статистика")
+    kb.button(text="📉 Рост")
     kb.button(text="➖ Удалить канал")
     kb.button(text="ℹ️ Помощь")
-    kb.adjust(2, 2, 1)
+    kb.adjust(2, 2, 2)
     return kb.as_markup(resize_keyboard=True, one_time_keyboard=False)
 
 def cancel_kb():
@@ -81,6 +87,16 @@ def format_number(value: int) -> str:
 # ----------------------------
 router = Router()
 
+def format_number(value: int | float) -> str:
+    if isinstance(value, float):
+        return f"{value:,.2f}".replace(",", " ")
+    return f"{value:,}".replace(",", " ")
+
+def format_pct(value: float | None) -> str:
+    if value is None:
+        return "н/д"
+    return f"{value:.2f}%"
+
 
 @router.errors()
 async def on_error(event: ErrorEvent):
@@ -88,6 +104,10 @@ async def on_error(event: ErrorEvent):
         logging.warning("TelegramNetworkError: %s", event.exception)
         return True  # подавили — бот продолжает работать
     return False
+
+@router.message(Command("growth"))
+async def growth_command(message: Message):
+    await growth_btn(message)
 
 @router.message(CommandStart())
 async def start(message: Message):
@@ -129,6 +149,108 @@ async def help_cmd(message: Message):
 @router.message(F.text == "ℹ️ Помощь")
 async def help_btn(message: Message):
     await help_cmd(message)
+
+@router.message(F.text == "📉 Рост")
+async def growth_btn(message: Message):
+    if message.from_user is None:
+        await message.answer("Не смог определить пользователя.")
+        return
+
+    api_key = os.getenv("YOUTUBE_API_KEY")
+    if not api_key:
+        await message.answer("❌ В .env не найден YOUTUBE_API_KEY")
+        return
+
+    user_id = message.from_user.id
+    channels = await list_user_channels(user_id)
+
+    if not channels:
+        await message.answer(
+            "У тебя пока нет добавленных каналов.\nНажми «➕ Добавить канал».",
+            reply_markup=main_menu_kb(),
+        )
+        return
+
+    await message.answer("⏳ Обновляю снапшоты и считаю рост...")
+
+    # 1. Сохраняем свежий снапшот по каждому каналу
+    for channel_id in channels:
+        try:
+            st = await fetch_channel_stats(api_key, channel_id)
+            await save_snapshot(
+                channel_key=channel_id,
+                subscribers=st["subscribers"],
+                views=st["views"],
+                videos=st["videos"],
+            )
+        except Exception as e:
+            await message.answer(f"❌ Не удалось обновить {channel_id}: {e}")
+
+    # 2. Считаем отчёт по каждому каналу
+    for channel_id in channels:
+        snapshots = await get_channel_snapshots(channel_id)
+        report = build_growth_report(snapshots)
+
+        if not report["ok"]:
+            await message.answer(
+                f"📺 <code>{channel_id}</code>\n"
+                f"Недостаточно данных: {report['reason']}",
+                reply_markup=main_menu_kb(),
+            )
+            continue
+
+        latest = report["latest"]
+        periods = report["periods"]
+        acceleration = report["acceleration"]
+
+        def metric_block(metric_name: str, metric_key: str) -> str:
+            lines = [f"<b>{metric_name}</b>"]
+
+            for days in [1, 7, 30]:
+                item = periods[days][metric_key]
+                if item is None:
+                    lines.append(f"• {days}д: недостаточно данных")
+                    continue
+
+                lines.append(
+                    f"• {days}д: "
+                    f"{format_number(item['growth_abs'])} | "
+                    f"ср/день {format_number(item['avg_daily'])} | "
+                    f"{format_pct(item['pct_growth'])}"
+                )
+
+            return "\n".join(lines)
+
+        text_parts = [
+            f"📺 <b>{channel_id}</b>",
+            f"Текущие значения:",
+            f"👥 Подписчики: <b>{format_number(latest['subscribers'])}</b>",
+            f"👁 Просмотры: <b>{format_number(latest['views'])}</b>",
+            f"🎞 Видео: <b>{format_number(latest['videos'])}</b>",
+            "",
+            metric_block("Подписчики", "subscribers"),
+            "",
+            metric_block("Просмотры", "views"),
+            "",
+            metric_block("Видео", "videos"),
+        ]
+
+        if acceleration:
+            text_parts.extend([
+                "",
+                "<b>Темп роста подписчиков</b>",
+                f"• Последние 7д: {format_number(acceleration['current_7d_avg_daily_subs'])}/день "
+                f"({format_pct(acceleration['current_7d_pct'])})",
+                f"• Предыдущие 7д: {format_number(acceleration['previous_7d_avg_daily_subs'])}/день "
+                f"({format_pct(acceleration['previous_7d_pct'])})",
+                f"• Итог: <b>{acceleration['trend']}</b> "
+                f"({format_number(acceleration['diff_avg_daily_subs'])}/день)",
+            ])
+
+        await message.answer(
+            "\n".join(text_parts),
+            reply_markup=main_menu_kb(),
+        )
 
 
 @router.message(F.text == "➕ Добавить канал")
@@ -412,7 +534,7 @@ async def main():
     if not token:
         raise RuntimeError("BOT_TOKEN not found. Set it in env or .env file.")
 
-    session = AiohttpSession(timeout=120)  # <-- ВАЖНО: число, не ClientTimeout
+    session = AiohttpSession(timeout=120)
 
     bot = Bot(
         token=token,
@@ -422,10 +544,23 @@ async def main():
 
     await init_db()
 
+    # Планировщик снапшотов
+    scheduler = build_scheduler()
+    scheduler.start()
+
+    # Опционально: один раз собрать снапшоты сразу при старте
+    try:
+        await collect_snapshots_once()
+    except Exception as e:
+        logging.warning("Initial snapshot collection failed: %s", e)
+
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        scheduler.shutdown(wait=False)
 
 
 

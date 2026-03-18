@@ -1,5 +1,6 @@
 import aiosqlite
 from pathlib import Path
+from datetime import datetime, UTC
 
 DB_PATH = Path("bot.db")
 
@@ -33,8 +34,102 @@ async def init_db() -> None:
             FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE
         );
         """)
+        
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        channel_id INTEGER NOT NULL,
+        subscribers INTEGER NOT NULL,
+        views INTEGER NOT NULL,
+        videos INTEGER NOT NULL,
+        ts TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE
+        );
+        """)
+
+        await db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_snapshots_channel_ts
+        ON snapshots(channel_id, ts);
+        """)
 
         await db.commit()
+
+async def save_snapshot(
+    channel_key: str,
+    subscribers: int,
+    views: int,
+    videos: int,
+    ts: str | None = None,
+) -> None:
+    """
+    Сохраняет снимок статистики канала.
+    channel_key = твой UC...
+    """
+    if ts is None:
+        ts = datetime.now(UTC).isoformat(timespec="seconds")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA foreign_keys = ON;")
+
+        async with db.execute(
+            "SELECT id FROM channels WHERE channel_key = ?;",
+            (channel_key,),
+        ) as cur:
+            row = await cur.fetchone()
+            if row is None:
+                raise RuntimeError(f"Канал {channel_key} не найден в БД.")
+            channel_id = row[0]
+
+        await db.execute(
+            """
+            INSERT INTO snapshots(channel_id, subscribers, views, videos, ts)
+            VALUES (?, ?, ?, ?, ?);
+            """,
+            (channel_id, subscribers, views, videos, ts),
+        )
+        await db.commit()
+
+
+async def get_channel_snapshots(channel_key: str) -> list[dict]:
+    """
+    Возвращает все снапшоты канала в порядке возрастания времени.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA foreign_keys = ON;")
+
+        async with db.execute(
+            """
+            SELECT s.ts, s.subscribers, s.views, s.videos
+            FROM snapshots s
+            JOIN channels c ON c.id = s.channel_id
+            WHERE c.channel_key = ?
+            ORDER BY s.ts ASC;
+            """,
+            (channel_key,),
+        ) as cur:
+            rows = await cur.fetchall()
+
+    return [
+        {
+            "ts": row[0],
+            "subscribers": row[1],
+            "views": row[2],
+            "videos": row[3],
+        }
+        for row in rows
+    ]
+
+async def get_all_channel_keys() -> list[str]:
+    """
+    Возвращает все уникальные channel_key (UC...) из таблицы channels.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA foreign_keys = ON;")
+        async with db.execute(
+            "SELECT channel_key FROM channels ORDER BY created_at ASC;"
+        ) as cur:
+            rows = await cur.fetchall()
+            return [row[0] for row in rows]
 
 
 async def add_user(user_id: int) -> None:
