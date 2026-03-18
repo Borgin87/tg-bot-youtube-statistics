@@ -26,7 +26,7 @@ from db import (
     remove_channel_for_user,
     remove_all_channels_for_user,
 )
-from youtube_api import fetch_channel_stats, YouTubeApiError
+from youtube_api import resolve_channel_id, fetch_channel_stats, YouTubeApiError
 
 try:
     from dotenv import load_dotenv
@@ -53,9 +53,10 @@ def main_menu_kb():
     kb = ReplyKeyboardBuilder()
     kb.button(text="➕ Добавить канал")
     kb.button(text="📊 Мои каналы")
+    kb.button(text="📈 Статистика")
     kb.button(text="➖ Удалить канал")
     kb.button(text="ℹ️ Помощь")
-    kb.adjust(2, 2)
+    kb.adjust(2, 2, 1)
     return kb.as_markup(resize_keyboard=True, one_time_keyboard=False)
 
 def cancel_kb():
@@ -71,6 +72,9 @@ def inline_actions_kb():
     kb.adjust(1, 1)
     return kb.as_markup()
 
+
+def format_number(value: int) -> str:
+    return f"{value:,}".replace(",", " ")
 
 # ----------------------------
 # Router / Handlers
@@ -101,6 +105,11 @@ async def start(message: Message):
         parse_mode=ParseMode.MARKDOWN,
     )
     await message.answer("Быстрые действия:", reply_markup=inline_actions_kb())
+
+
+@router.message(Command("stats"))
+async def stats_command(message: Message):
+    await stats_btn(message)
 
 
 @router.message(Command("help"))
@@ -135,6 +144,77 @@ async def add_channel_btn(message: Message, state: FSMContext):
         reply_markup=cancel_kb(),
         parse_mode=ParseMode.MARKDOWN,
     )
+
+
+@router.message(F.text == "📈 Статистика")
+async def stats_btn(message: Message):
+    if message.from_user is None:
+        await message.answer("Не смог определить пользователя.")
+        return
+
+    api_key = os.getenv("YOUTUBE_API_KEY")
+    if not api_key:
+        await message.answer("❌ В .env не найден YOUTUBE_API_KEY")
+        return
+
+    user_id = message.from_user.id
+    channels = await list_user_channels(user_id)
+
+    if not channels:
+        await message.answer(
+            "У тебя пока нет добавленных каналов.\nНажми «➕ Добавить канал».",
+            reply_markup=main_menu_kb(),
+        )
+        return
+
+    await message.answer("⏳ Собираю статистику по каналам...")
+
+    tasks = [fetch_channel_stats(api_key, ch_id) for ch_id in channels]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    blocks = []
+
+    for ch_id, result in zip(channels, results):
+        if isinstance(result, Exception):
+            blocks.append(
+                f"❌ <code>{ch_id}</code>\n"
+                f"Ошибка: {result}"
+            )
+            continue
+
+        subscribers_text = (
+            "скрыты"
+            if result["hidden_subs"]
+            else format_number(result["subscribers"])
+        )
+
+        block = (
+            f"📺 <b>{result['title']}</b>\n"
+            f"🆔 <code>{result['channel_id']}</code>\n"
+            f"👥 Подписчики: <b>{subscribers_text}</b>\n"
+            f"👁 Просмотры: <b>{format_number(result['views'])}</b>\n"
+            f"🎞 Видео: <b>{format_number(result['videos'])}</b>"
+        )
+        blocks.append(block)
+
+    text = "\n\n".join(blocks)
+
+    if len(text) <= 4000:
+        await message.answer(text, reply_markup=main_menu_kb())
+    else:
+        chunk = ""
+        for block in blocks:
+            if len(chunk) + len(block) + 2 > 4000:
+                await message.answer(chunk, reply_markup=main_menu_kb())
+                chunk = block
+            else:
+                if chunk:
+                    chunk += "\n\n"
+                chunk += block
+
+        if chunk:
+            await message.answer(chunk, reply_markup=main_menu_kb())
+            
 
 @router.message(F.text == "➖ Удалить канал")
 async def delete_channel_btn(message: Message, state: FSMContext):
@@ -200,17 +280,35 @@ async def add_channel_input(message: Message, state: FSMContext):
         await message.answer("Не смог прочитать сообщение. Попробуй ещё раз.")
         return
 
+    api_key = os.getenv("YOUTUBE_API_KEY")
+    if not api_key:
+        await message.answer("❌ В .env не найден YOUTUBE_API_KEY")
+        return
+
     user_id = message.from_user.id
-    raw = message.text.strip()
+    raw_input = message.text.strip()
 
-    await add_channel_for_user(user_id, raw)
+    try:
+        channel_id, title = await resolve_channel_id(api_key, raw_input)
+    except YouTubeApiError as e:
+        await message.answer(f"❌ Ошибка поиска канала:\n{e}")
+        return
 
+    await add_channel_for_user(user_id, channel_id)
     await state.clear()
-    await message.answer(
-        f"✅ Добавил: `{raw}`\n\nТеперь можешь посмотреть список в «📊 Мои каналы».",
-        reply_markup=main_menu_kb(),
-        parse_mode=ParseMode.MARKDOWN,
-    )
+
+    if title:
+        await message.answer(
+            f"✅ Канал добавлен:\n"
+            f"<b>{title}</b>\n"
+            f"<code>{channel_id}</code>",
+            reply_markup=main_menu_kb(),
+        )
+    else:
+        await message.answer(
+            f"✅ Канал добавлен:\n<code>{channel_id}</code>",
+            reply_markup=main_menu_kb(),
+        )
 
 
 @router.message(F.text == "📊 Мои каналы")
