@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 
-from analytics import build_growth_report
+from analytics import build_growth_report, build_portfolio_report, render_growth_chart
 from db import save_snapshot, get_channel_snapshots
 
 from snapshot_scheduler import build_scheduler, collect_snapshots_once
@@ -22,6 +22,7 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.types import (
     Message,
     CallbackQuery,
+    BufferedInputFile,
 )
 from db import (
     init_db,
@@ -60,9 +61,10 @@ def main_menu_kb():
     kb.button(text="📊 Мои каналы")
     kb.button(text="📈 Статистика")
     kb.button(text="📉 Рост")
+    kb.button(text="📑 Отчёт")
     kb.button(text="➖ Удалить канал")
     kb.button(text="ℹ️ Помощь")
-    kb.adjust(2, 2, 2)
+    kb.adjust(2, 2, 2, 1)
     return kb.as_markup(resize_keyboard=True, one_time_keyboard=False)
 
 def cancel_kb():
@@ -97,6 +99,69 @@ def format_pct(value: float | None) -> str:
         return "н/д"
     return f"{value:.2f}%"
 
+def is_report_button_text(text: str | None) -> bool:
+    if not text:
+        return False
+    normalized = text.strip().lower().replace("ё", "е")
+    normalized = normalized.removeprefix("📑").strip()
+    return normalized in {"отчет", "report"}
+
+
+async def send_growth_report_for_channel(message: Message, channel_id: str, api_key: str) -> None:
+    try:
+        st = await fetch_channel_stats(api_key, channel_id)
+        title = st.get("title") or channel_id
+        await save_snapshot(
+            channel_key=channel_id,
+            subscribers=st["subscribers"],
+            views=st["views"],
+            videos=st["videos"],
+        )
+    except Exception as e:
+        await message.answer(f"❌ Не удалось обновить {channel_id}: {e}", reply_markup=main_menu_kb())
+        return
+
+    snapshots = await get_channel_snapshots(channel_id)
+    report = build_growth_report(snapshots)
+    if not report["ok"]:
+        await message.answer(
+            f"📺 <code>{channel_id}</code>\n"
+            f"Недостаточно данных: {report['reason']}",
+            reply_markup=main_menu_kb(),
+        )
+        return
+
+    latest = report["latest"]
+    periods = report["periods"]
+    acceleration = report["acceleration"]
+
+    text_parts = [
+        f"📺 <b>{title}</b> (<code>{channel_id}</code>)",
+        f"👥 Подписчики: <b>{format_number(latest['subscribers'])}</b>",
+        f"   • 7д: {format_number(periods[7]['subscribers']['growth_abs']) if periods[7]['subscribers'] else 'н/д'}",
+        f"   • 30д: {format_number(periods[30]['subscribers']['growth_abs']) if periods[30]['subscribers'] else 'н/д'}",
+        f"👁 Просмотры: <b>{format_number(latest['views'])}</b>",
+        f"   • 7д: {format_number(periods[7]['views']['growth_abs']) if periods[7]['views'] else 'н/д'}",
+        f"   • 30д: {format_number(periods[30]['views']['growth_abs']) if periods[30]['views'] else 'н/д'}",
+    ]
+
+    if acceleration:
+        text_parts.append(
+            f"⚡ Темп подписчиков: <b>{acceleration['trend']}</b> "
+            f"({format_number(acceleration['diff_avg_daily_subs'])}/день)"
+        )
+
+    await message.answer("\n".join(text_parts), reply_markup=main_menu_kb())
+
+    chart_png = render_growth_chart(snapshots, title)
+    if chart_png is not None:
+        photo = BufferedInputFile(chart_png, filename=f"{channel_id}_growth.png")
+        await message.answer_photo(
+            photo=photo,
+            caption=f"📊 График роста: <b>{title}</b>",
+            reply_markup=main_menu_kb(),
+        )
+
 
 @router.errors()
 async def on_error(event: ErrorEvent):
@@ -108,6 +173,7 @@ async def on_error(event: ErrorEvent):
 @router.message(Command("growth"))
 async def growth_command(message: Message):
     await growth_btn(message)
+
 
 @router.message(CommandStart())
 async def start(message: Message):
@@ -138,6 +204,8 @@ async def help_cmd(message: Message):
         "Команды:\n"
         "• /start — меню\n"
         "• /help — помощь\n\n"
+        "• /growth — короткий отчёт + графики\n"
+        "• /report — полный аналитический отчёт\n\n"
         "Кнопки:\n"
         "• ➕ Добавить канал — добавляет строку (id/url/@handle)\n"
         "• 📊 Мои каналы — показывает список\n\n"
@@ -171,12 +239,84 @@ async def growth_btn(message: Message):
         )
         return
 
-    await message.answer("⏳ Обновляю снапшоты и считаю рост...")
+    if len(channels) == 1:
+        await message.answer("⏳ Обновляю снапшот и готовлю краткий отчёт...")
+        await send_growth_report_for_channel(message, channels[0], api_key)
+        return
 
-    # 1. Сохраняем свежий снапшот по каждому каналу
+    channel_titles: dict[str, str] = {}
+    title_tasks = [fetch_channel_stats(api_key, channel_id) for channel_id in channels]
+    title_results = await asyncio.gather(*title_tasks, return_exceptions=True)
+    for channel_id, result in zip(channels, title_results):
+        if isinstance(result, Exception):
+            channel_titles[channel_id] = channel_id
+        else:
+            channel_titles[channel_id] = (result.get("title") or channel_id).strip()
+
+    kb = InlineKeyboardBuilder()
+    for idx, channel_id in enumerate(channels, start=1):
+        title = channel_titles.get(channel_id, channel_id)
+        short_title = title if len(title) <= 28 else f"{title[:28]}..."
+        kb.button(text=f"{idx}) {short_title}", callback_data=f"growth:{channel_id}")
+    kb.adjust(1)
+
+    await message.answer(
+        "Выбери канал для отчёта по росту:",
+        reply_markup=kb.as_markup(),
+    )
+
+
+@router.callback_query(F.data.startswith("growth:"))
+async def growth_channel_pick(call: CallbackQuery):
+    if call.from_user is None:
+        await call.answer("Не смог определить пользователя.", show_alert=True)
+        return
+
+    api_key = os.getenv("YOUTUBE_API_KEY")
+    if not api_key:
+        await call.answer("Не найден YOUTUBE_API_KEY", show_alert=True)
+        return
+
+    channel_id = (call.data or "").split(":", 1)[1]
+    allowed_channels = await list_user_channels(call.from_user.id)
+    if channel_id not in allowed_channels:
+        await call.answer("Канал не найден в твоём списке.", show_alert=True)
+        return
+
+    await call.answer("Готовлю отчёт...")
+    if call.message:
+        await call.message.edit_reply_markup(reply_markup=None)
+        await send_growth_report_for_channel(call.message, channel_id, api_key)
+
+
+@router.message(lambda message: is_report_button_text(message.text))
+@router.message(Command("report"))
+async def report_btn(message: Message):
+    if message.from_user is None:
+        await message.answer("Не смог определить пользователя.")
+        return
+
+    api_key = os.getenv("YOUTUBE_API_KEY")
+    if not api_key:
+        await message.answer("❌ В .env не найден YOUTUBE_API_KEY")
+        return
+
+    user_id = message.from_user.id
+    channels = await list_user_channels(user_id)
+    if not channels:
+        await message.answer(
+            "У тебя пока нет добавленных каналов.\nНажми «➕ Добавить канал».",
+            reply_markup=main_menu_kb(),
+        )
+        return
+
+    await message.answer("⏳ Формирую полный аналитический отчёт...")
+
+    channel_titles: dict[str, str] = {}
     for channel_id in channels:
         try:
             st = await fetch_channel_stats(api_key, channel_id)
+            channel_titles[channel_id] = st.get("title") or channel_id
             await save_snapshot(
                 channel_key=channel_id,
                 subscribers=st["subscribers"],
@@ -186,71 +326,53 @@ async def growth_btn(message: Message):
         except Exception as e:
             await message.answer(f"❌ Не удалось обновить {channel_id}: {e}")
 
-    # 2. Считаем отчёт по каждому каналу
+    channel_reports = []
     for channel_id in channels:
         snapshots = await get_channel_snapshots(channel_id)
-        report = build_growth_report(snapshots)
-
-        if not report["ok"]:
-            await message.answer(
-                f"📺 <code>{channel_id}</code>\n"
-                f"Недостаточно данных: {report['reason']}",
-                reply_markup=main_menu_kb(),
-            )
-            continue
-
-        latest = report["latest"]
-        periods = report["periods"]
-        acceleration = report["acceleration"]
-
-        def metric_block(metric_name: str, metric_key: str) -> str:
-            lines = [f"<b>{metric_name}</b>"]
-
-            for days in [1, 7, 30]:
-                item = periods[days][metric_key]
-                if item is None:
-                    lines.append(f"• {days}д: недостаточно данных")
-                    continue
-
-                lines.append(
-                    f"• {days}д: "
-                    f"{format_number(item['growth_abs'])} | "
-                    f"ср/день {format_number(item['avg_daily'])} | "
-                    f"{format_pct(item['pct_growth'])}"
-                )
-
-            return "\n".join(lines)
-
-        text_parts = [
-            f"📺 <b>{channel_id}</b>",
-            f"Текущие значения:",
-            f"👥 Подписчики: <b>{format_number(latest['subscribers'])}</b>",
-            f"👁 Просмотры: <b>{format_number(latest['views'])}</b>",
-            f"🎞 Видео: <b>{format_number(latest['videos'])}</b>",
-            "",
-            metric_block("Подписчики", "subscribers"),
-            "",
-            metric_block("Просмотры", "views"),
-            "",
-            metric_block("Видео", "videos"),
-        ]
-
-        if acceleration:
-            text_parts.extend([
-                "",
-                "<b>Темп роста подписчиков</b>",
-                f"• Последние 7д: {format_number(acceleration['current_7d_avg_daily_subs'])}/день "
-                f"({format_pct(acceleration['current_7d_pct'])})",
-                f"• Предыдущие 7д: {format_number(acceleration['previous_7d_avg_daily_subs'])}/день "
-                f"({format_pct(acceleration['previous_7d_pct'])})",
-                f"• Итог: <b>{acceleration['trend']}</b> "
-                f"({format_number(acceleration['diff_avg_daily_subs'])}/день)",
-            ])
-
-        await message.answer(
-            "\n".join(text_parts),
-            reply_markup=main_menu_kb(),
+        channel_reports.append(
+            {
+                "channel_id": channel_id,
+                "title": channel_titles.get(channel_id, channel_id),
+                "report": build_growth_report(snapshots),
+            }
         )
+
+    portfolio = build_portfolio_report(channel_reports)
+    if not portfolio["ok"]:
+        await message.answer(f"❌ {portfolio['reason']}", reply_markup=main_menu_kb())
+        return
+
+    def top_block(title: str, items: list[dict]) -> list[str]:
+        lines = [f"<b>{title}</b>"]
+        if not items:
+            lines.append("• недостаточно данных")
+            return lines
+        for idx, item in enumerate(items, start=1):
+            lines.append(
+                f"{idx}) <b>{item['title']}</b>: "
+                f"{format_number(item['growth_abs'])} "
+                f"(ср/день {format_number(item['avg_daily'])}, {format_pct(item['pct_growth'])})"
+            )
+        return lines
+
+    summary_lines = [
+        "📈 <b>Аналитический отчёт</b>",
+        f"Каналов: {portfolio['channels_total']}, с данными: {portfolio['channels_with_data']}",
+        "",
+    ]
+    summary_lines.extend(top_block("Топ роста подписчиков за 7д", portfolio["top_subs_7"]))
+    summary_lines.append("")
+    summary_lines.extend(top_block("Топ роста подписчиков за 30д", portfolio["top_subs_30"]))
+    summary_lines.append("")
+    summary_lines.extend(top_block("Топ роста просмотров за 7д", portfolio["top_views_7"]))
+    summary_lines.append("")
+    summary_lines.extend(top_block("Топ роста просмотров за 30д", portfolio["top_views_30"]))
+    summary_lines.append("")
+    summary_lines.extend(top_block("Ускоряются (подписчики)", portfolio["accelerating"]))
+    summary_lines.append("")
+    summary_lines.extend(top_block("Замедляются (подписчики)", portfolio["slowing"]))
+
+    await message.answer("\n".join(summary_lines), reply_markup=main_menu_kb())
 
 
 @router.message(F.text == "➕ Добавить канал")
@@ -534,7 +656,11 @@ async def main():
     if not token:
         raise RuntimeError("BOT_TOKEN not found. Set it in env or .env file.")
 
-    session = AiohttpSession(timeout=120)
+    tg_proxy = os.getenv("TG_PROXY")
+    if tg_proxy:
+        logging.info("Using Telegram proxy from TG_PROXY")
+
+    session = AiohttpSession(proxy=tg_proxy, timeout=120)
 
     bot = Bot(
         token=token,
