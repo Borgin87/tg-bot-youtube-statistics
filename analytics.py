@@ -1,4 +1,8 @@
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from io import BytesIO
 
 
 def _prepare_df(snapshots: list[dict]) -> pd.DataFrame:
@@ -156,3 +160,98 @@ def build_growth_report(snapshots: list[dict]) -> dict:
         "acceleration": acceleration,
         "history_points": len(df),
     }
+
+
+def build_portfolio_report(channel_reports: list[dict]) -> dict:
+    """
+    channel_reports: [{"channel_id": str, "title": str, "report": build_growth_report(...)}]
+    """
+    valid = [item for item in channel_reports if item.get("report", {}).get("ok")]
+    if not valid:
+        return {"ok": False, "reason": "Недостаточно данных для сводки."}
+
+    def pick_metric(days: int, metric: str):
+        rows = []
+        for item in valid:
+            block = item["report"]["periods"].get(days, {}).get(metric)
+            if block is None:
+                continue
+            rows.append(
+                {
+                    "channel_id": item["channel_id"],
+                    "title": item.get("title") or item["channel_id"],
+                    "growth_abs": block["growth_abs"],
+                    "avg_daily": block["avg_daily"],
+                    "pct_growth": block["pct_growth"],
+                }
+            )
+        rows.sort(key=lambda x: x["growth_abs"], reverse=True)
+        return rows
+
+    top_subs_7 = pick_metric(7, "subscribers")[:3]
+    top_subs_30 = pick_metric(30, "subscribers")[:3]
+    top_views_7 = pick_metric(7, "views")[:3]
+    top_views_30 = pick_metric(30, "views")[:3]
+
+    accelerations = []
+    for item in valid:
+        accel = item["report"].get("acceleration")
+        if not accel:
+            continue
+        accelerations.append(
+            {
+                "channel_id": item["channel_id"],
+                "title": item.get("title") or item["channel_id"],
+                "trend": accel["trend"],
+                "diff_avg_daily_subs": accel["diff_avg_daily_subs"],
+            }
+        )
+
+    accelerating = sorted(
+        [x for x in accelerations if x["diff_avg_daily_subs"] > 0],
+        key=lambda x: x["diff_avg_daily_subs"],
+        reverse=True,
+    )[:3]
+    slowing = sorted(
+        [x for x in accelerations if x["diff_avg_daily_subs"] < 0],
+        key=lambda x: x["diff_avg_daily_subs"],
+    )[:3]
+
+    return {
+        "ok": True,
+        "channels_total": len(channel_reports),
+        "channels_with_data": len(valid),
+        "top_subs_7": top_subs_7,
+        "top_subs_30": top_subs_30,
+        "top_views_7": top_views_7,
+        "top_views_30": top_views_30,
+        "accelerating": accelerating,
+        "slowing": slowing,
+    }
+
+
+def render_growth_chart(snapshots: list[dict], channel_label: str) -> bytes | None:
+    df = _prepare_df(snapshots)
+    if df.empty or len(df) < 2:
+        return None
+
+    fig, axes = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
+    fig.suptitle(f"Динамика канала: {channel_label}")
+
+    axes[0].plot(df["ts"], df["subscribers"], marker="o")
+    axes[0].set_ylabel("Подписчики")
+    axes[0].grid(True, alpha=0.3)
+
+    axes[1].plot(df["ts"], df["views"], marker="o", color="tab:orange")
+    axes[1].set_ylabel("Просмотры")
+    axes[1].set_xlabel("Дата")
+    axes[1].grid(True, alpha=0.3)
+
+    fig.autofmt_xdate()
+    fig.tight_layout()
+
+    buffer = BytesIO()
+    fig.savefig(buffer, format="png", dpi=130)
+    plt.close(fig)
+    buffer.seek(0)
+    return buffer.read()
